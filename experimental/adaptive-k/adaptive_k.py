@@ -50,7 +50,17 @@ has its own g. "gated" uses a mode's rates only when every decoding request is
 in that mode, since the batch shares one k, and is the default; "1" uses them
 per request, and "0" turns code mode off. A fence is a run of three backticks,
 which the tokenizer can split across tokens (a closing fence becomes "``" then
-"`\n"), so runs are counted across tokens.
+"`\n"), so runs are counted across tokens. "split" also keeps the usual rates
+to prose: each request's prose, code and tool-call rates learn only from steps
+in their own mode, and each request chooses with its current mode's rates. In
+"gated" and "1" the usual rates learn from every step, so after a code block or
+tool call they start the prose that follows too high.
+
+The control file can also say "codemode 0|1|gated|split" (on a line of its
+own, beside or instead of "force N") to switch code mode without a restart,
+for A/B runs on one boot. VLLM_ADAPTIVE_K_TRACE names a file that gets one
+line per request per step, "time request mode drafted accepted output_tokens",
+for replaying policies offline.
 """
 
 import os
@@ -72,7 +82,9 @@ _PRIOR = 0.8
 _GLOBAL_ALPHA = 0.05
 _GLOBAL_DRIFT = 0.01
 _PER_REQUEST = os.environ.get("VLLM_ADAPTIVE_K_PER_REQUEST") == "1"
-_CODE_MODE = os.environ.get("VLLM_ADAPTIVE_K_CODE_MODE", "gated")  # "gated", "1" or "0" (off)
+_CODE_MODE = os.environ.get("VLLM_ADAPTIVE_K_CODE_MODE", "gated")  # "gated", "split", "1" or "0" (off)
+_CODE_MODES = ("0", "1", "gated", "split")
+_TRACE = os.environ.get("VLLM_ADAPTIVE_K_TRACE", "")
 _PROSE, _CODE, _TOOL = 0, 1, 2
 _ONLINE = os.environ.get("VLLM_ADAPTIVE_K_ONLINE", "1") == "1"
 # Fitted on GLM-5.3-Flash at TP=4 on GB10 (k 2, 3, 5 and 7 forced, 1-32 streams, code,
@@ -144,6 +156,8 @@ class AdaptiveKScheduler(AsyncScheduler):
         self._control = os.environ.get("VLLM_ADAPTIVE_K_CONTROL", "")
         self._control_mtime = 0.0
         self._force: int | None = None
+        self._code_mode = _CODE_MODE
+        self._trace = open(_TRACE, "a", buffering=1 << 16) if _TRACE else None
         self._rates: dict[str, np.ndarray] = {}
         self._global = np.full(self.num_spec_tokens, _PRIOR)
         # Code mode: per (request, mode) rates, per-mode g, and each request's mode.
@@ -211,10 +225,10 @@ class AdaptiveKScheduler(AsyncScheduler):
 
     def _active_rates(self, decoding: list[str]) -> list[np.ndarray]:
         """Each request's rates for choosing k: its mode's where code mode says so."""
-        if _CODE_MODE == "0":
+        if self._code_mode == "0":
             return [self._rates[r] for r in decoding]
         modes = [self._mode.get(r, _PROSE) for r in decoding]
-        if _CODE_MODE == "gated" and (len(set(modes)) > 1 or modes[0] == _PROSE):
+        if self._code_mode == "gated" and (len(set(modes)) > 1 or modes[0] == _PROSE):
             return [self._rates[r] for r in decoding]
         return [self._rates[r] if m == _PROSE else
                 self._mode_rates.setdefault((r, m), self._mode_global[m].copy())
@@ -265,8 +279,13 @@ class AdaptiveKScheduler(AsyncScheduler):
         c = self._rates.get(req_id)
         if c is None:
             c = self._rates[req_id] = g.copy()
-        self._update(c, g, drafted, accepted)
         mode = self._mode.get(req_id, _PROSE)
+        if self._trace is not None:
+            request = self.requests.get(req_id)
+            self._trace.write(f"{time.monotonic():.4f} {req_id} {mode} {drafted} {accepted} "
+                              f"{len(request.output_token_ids) if request else -1}\n")
+        if mode == _PROSE or self._code_mode != "split":
+            self._update(c, g, drafted, accepted)
         if mode != _PROSE:
             gm = self._mode_global[mode]
             self._update(self._mode_rates.setdefault((req_id, mode), gm.copy()), gm, drafted, accepted)
@@ -296,13 +315,17 @@ class AdaptiveKScheduler(AsyncScheduler):
         try:
             mtime = os.stat(self._control).st_mtime
         except FileNotFoundError:
-            self._force = None
+            self._force, self._code_mode = None, _CODE_MODE if self._backticks else "0"
             return
         if mtime != self._control_mtime:
             self._control_mtime = mtime
-            words = open(self._control).read().split()
-            self._force = int(words[1]) if len(words) == 2 and words[0] == "force" else None
-            logger.info("adaptive k: control file says %s", self._force or "adapt")
+            self._force, self._code_mode = None, _CODE_MODE
+            for words in (line.split() for line in open(self._control)):
+                if len(words) == 2 and words[0] == "force":
+                    self._force = int(words[1])
+                elif len(words) == 2 and words[0] == "codemode" and words[1] in _CODE_MODES:
+                    self._code_mode = words[1] if self._backticks else "0"
+            logger.info("adaptive k: control file says %s, code mode %s", self._force or "adapt", self._code_mode)
 
     def _choose(self, req_ids: list[str]) -> int:
         self._read_control()
@@ -325,7 +348,7 @@ class AdaptiveKScheduler(AsyncScheduler):
         decoding = [r for r in req_ids if r in self._rates]
         if not decoding:
             return {}
-        survival = np.cumprod(np.stack([self._rates[r] for r in decoding]), axis=1)
+        survival = np.cumprod(np.stack(self._active_rates(decoding)), axis=1)
         order = np.argsort(-survival, axis=None, kind="stable")
         best_b, best_score, n = 0, len(decoding) / self._step_cost(len(decoding)), len(decoding)
         gained = 0.0
@@ -344,7 +367,7 @@ class AdaptiveKScheduler(AsyncScheduler):
                 d.pop(req_id, None)
             for m in (_CODE, _TOOL):
                 self._mode_rates.pop((req_id, m), None)
-        if _CODE_MODE != "0":
+        if self._code_mode != "0":
             self._track_modes(list(scheduler_output.num_scheduled_tokens))
         self._read_control()
         if self.num_spec_tokens and _PER_REQUEST and self._force is None:
